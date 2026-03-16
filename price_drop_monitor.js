@@ -48,8 +48,9 @@ function generateDates() {
   return dates;
 }
 
-function buildUrl(hotelId, checkIn, checkOut) {
-  return `https://www.bgoperator.ru/price.shtml?action=price&tid=211&idt=&flt2=100510000863&id_price=121110211811&data=${checkIn}&d2=${checkOut}&f7=7&f3=&f8=&ho=0&F4=${hotelId}&ins=0-40000-EUR&flt=100411293179&p=0100319900.0100319900`;
+function buildUrl(hotel, checkIn, checkOut) {
+  const idPrice = hotel.id_price || '121110211811';
+  return `https://www.bgoperator.ru/price.shtml?action=price&tid=211&idt=&flt2=100510000863&id_price=${idPrice}&data=${checkIn}&d2=${checkOut}&f7=7&f3=&f8=&ho=0&F4=${hotel.id}&ins=0-40000-EUR&flt=100411293179&p=${hotel.p}`;
 }
 
 // ─── Telegram ────────────────────────────────────────────────────────────────
@@ -201,8 +202,8 @@ async function main() {
   try {
     const tasks = [];
     for (const { checkIn, checkOut } of dates) {
-      for (const hotelId of hotels) {
-        tasks.push({ url: buildUrl(hotelId, checkIn, checkOut), checkIn, hotelId });
+      for (const hotel of hotels) {
+        tasks.push({ url: buildUrl(hotel, checkIn, checkOut), checkIn, hotelId: hotel.id });
       }
     }
     console.log(`Toplam istek: ${tasks.length}`);
