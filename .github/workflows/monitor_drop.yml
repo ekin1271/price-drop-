@@ -26,7 +26,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.CHAT_ID }}
-          GROUP_CHAT_ID: ${{ secrets.GROUP_CHAT_ID }}
         run: node price_drop_monitor.js
 
       - name: State dosyasını kaydet ve push et
