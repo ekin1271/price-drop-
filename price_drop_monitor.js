@@ -8,7 +8,7 @@ const TELEGRAM_GROUP_ID = process.env.GROUP_CHAT_ID;
 const STATE_FILE = 'drop_state.json';
 const HOTELS_FILE = 'hotels.json';
 const CONCURRENCY = 8;
-const DROP_THRESHOLD = 0.50; // %50 düşüş
+const DROP_THRESHOLD = 0.30; // %50 düşüş
 
 const PENINSULA_PATTERNS = [
   '103810219',    // Antalya
