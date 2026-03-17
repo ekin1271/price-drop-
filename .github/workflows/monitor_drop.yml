@@ -1,4 +1,5 @@
 name: Price Drop Monitor
+
 on:
   schedule:
     - cron: '0 * * * *'
@@ -7,9 +8,15 @@ on:
 permissions:
   contents: write
 
+# 🔥 KRİTİK: aynı anda 2 run olmasın
+concurrency:
+  group: price-drop-monitor
+  cancel-in-progress: false
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
+
     steps:
       - name: Kodu çek
         uses: actions/checkout@v4
@@ -22,6 +29,11 @@ jobs:
       - name: Bağımlılıkları yükle
         run: npm install
 
+      # 🔥 EN ÖNEMLİ FIX: önce güncel state'i çek
+      - name: Latest state çek
+        run: |
+          git pull origin main --rebase
+
       - name: Scripti çalıştır
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -33,7 +45,9 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git fetch origin
+
           git add drop_state.json
           git diff --staged --quiet || git commit -m "state güncellendi"
-          git push origin main || (git pull origin main --rebase -X ours && git push origin main)
+
+          # 🔥 SAFE PUSH (rebase yok, overwrite yok)
+          git push origin main
