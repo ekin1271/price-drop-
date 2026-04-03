@@ -8,12 +8,12 @@ const TELEGRAM_GROUP_ID = process.env.GROUP_CHAT_ID;
 const STATE_FILE = 'drop_state.json';
 const HOTELS_FILE = 'hotels.json';
 const CONCURRENCY = 8;
-const DROP_THRESHOLD = 0.40; // %50 düşüş
+const DROP_THRESHOLD = 0.40;
 
 const PENINSULA_PATTERNS = [
-  '103810219',    // Antalya
-  '103810221461', // Bodrum
-  '103810221462', // Bodrum
+  '103810219',
+  '103810221461',
+  '103810221462',
 ];
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -84,24 +84,14 @@ async function scrapePage(browser, url, checkIn, hotelId) {
   try { await page.waitForSelector('div.b-pr', { timeout: 30000 }); } catch(e) {}
   await sleep(2000);
 
-  const peninsulaPatterns = PENINSULA_PATTERNS;
-
   const offers = await page.evaluate((peninsulaPatterns, targetDate, expectedHotelId) => {
     const results = [];
     const blocks = document.querySelectorAll('div.b-pr');
 
     for (const block of blocks) {
-      // data-hid kontrolü
-      if (expectedHotelId) {
-        const nameDiv = block.querySelector('div.name[data-hid]');
-        if (nameDiv) {
-          const dataHid = nameDiv.getAttribute('data-hid');
-          if (dataHid && dataHid !== expectedHotelId) continue;
-        }
-      }
-
+      // Otel adı: b-pr içindeki ilk a[href*="code="] — Console'da doğrulandı
       let hotelName = '';
-      const hotelLink = block.querySelector('a[href*="action=shw"]');
+      const hotelLink = block.querySelector('a[href*="code="]');
       if (hotelLink) hotelName = hotelLink.textContent.trim();
 
       const allRows = block.querySelectorAll('tr');
@@ -138,10 +128,16 @@ async function scrapePage(browser, url, checkIn, hotelId) {
       }
     }
     return results;
-  }, peninsulaPatterns, checkIn, hotelId);
+  }, PENINSULA_PATTERNS, checkIn, hotelId);
 
   await page.close();
-  return offers;
+
+  // hotelName boş kaldıysa hotelId'yi fallback olarak kullan —
+  // bu sayede state key'i her zaman tutarlı olur
+  return offers.map(o => ({
+    ...o,
+    hotelName: o.hotelName || `hotel_${hotelId}`,
+  }));
 }
 
 async function scrapeWithDateShift(browser, url, checkIn, hotelId) {
@@ -215,14 +211,15 @@ async function main() {
         const { offers, usedCheckIn } = await scrapeWithDateShift(browser, task.url, task.checkIn, task.hotelId);
 
         for (const o of offers) {
+          // KEY: hotelName artık her zaman dolu (fallback: hotel_ID)
+          // roomType boşsa da UNKNOWN yazdığından key hep tutarlı
           const key = `${usedCheckIn}__${o.hotelName}__${o.roomType}`;
           const prevPrice = prevState[key];
           const newPrice  = o.price;
 
-          // State'e kaydet
+          // Her durumda state'e yaz — alarm olsa da olmasa da
           newState[key] = newPrice;
 
-          // Önceki fiyat varsa ve %50'den fazla düştüyse alarm
           if (prevPrice && prevPrice > 0) {
             const drop = (prevPrice - newPrice) / prevPrice;
             if (drop >= DROP_THRESHOLD) {
@@ -258,7 +255,6 @@ async function main() {
   if (alerts.length > 0) {
     console.log(`${alerts.length} fiyat düşüşü tespit edildi. Bildirim gönderiliyor...`);
 
-    // Gruplama
     const groups = {};
     for (const a of alerts) {
       const key = `${a.hotel}__${a.room}`;
