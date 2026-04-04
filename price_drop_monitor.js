@@ -84,15 +84,24 @@ async function scrapePage(browser, url, checkIn, hotelId) {
   try { await page.waitForSelector('div.b-pr', { timeout: 30000 }); } catch(e) {}
   await sleep(2000);
 
-  const offers = await page.evaluate((peninsulaPatterns, targetDate, expectedHotelId) => {
+  const offers = await page.evaluate((peninsulaPatterns, targetDate, fallbackHotelId) => {
+    // Her (hotelName, roomType) çifti için sadece BİR kayıt döndür.
+    const seen = new Set();
     const results = [];
     const blocks = document.querySelectorAll('div.b-pr');
 
     for (const block of blocks) {
-      // Otel adı: b-pr içindeki ilk a[href*="code="] — Console'da doğrulandı
+      // YENİ SELECTOR: otel adı artık div.name > a içinde
       let hotelName = '';
-      const hotelLink = block.querySelector('a[href*="code="]');
-      if (hotelLink) hotelName = hotelLink.textContent.trim();
+      const nameDiv = block.querySelector('div.name a');
+      if (nameDiv) {
+        hotelName = nameDiv.textContent.trim();
+      } else {
+        // Fallback: eski selector
+        const hotelLink = block.querySelector('a[href*="code="]');
+        if (hotelLink) hotelName = hotelLink.textContent.trim();
+      }
+      if (!hotelName) hotelName = `hotel_${fallbackHotelId}`;
 
       const allRows = block.querySelectorAll('tr');
 
@@ -100,7 +109,8 @@ async function scrapePage(browser, url, checkIn, hotelId) {
         const allLis = tr.querySelectorAll('li.s8.i_t1');
         if (allLis.length === 0) continue;
 
-        let chosenLi = allLis[0];
+        // Hedef tarihe en yakın li'yi seç
+        let chosenLi = null;
         if (targetDate) {
           for (const li of allLis) {
             if ((li.getAttribute('urr') || '').includes(targetDate)) {
@@ -109,20 +119,46 @@ async function scrapePage(browser, url, checkIn, hotelId) {
             }
           }
         }
+        if (!chosenLi) chosenLi = allLis[0];
 
         const urr = chosenLi.getAttribute('urr') || '';
         const isPeninsula = peninsulaPatterns.some(p => urr.includes(p));
         if (!isPeninsula) continue;
 
-        const priceLink = tr.querySelector('td.c_pe a[href*="x="]');
-        if (!priceLink) continue;
-        const m = (priceLink.getAttribute('href') || '').match(/[?&]x=(\d+)/);
-        if (!m) continue;
-        const price = parseInt(m[1], 10);
+        // YENİ FIYAT SELECTOR: <b class="r">XXXX</b> içindeki sayı
+        // Alternatif: URL'deki otv= parametresi
+        let price = 0;
+
+        // Önce <b class="r"> dene
+        const priceB = tr.querySelector('td.c_pe b.r, td.c_pe b');
+        if (priceB) {
+          const raw = priceB.textContent.trim().replace(/\s/g, '').replace(/[^\d]/g, '');
+          price = parseInt(raw, 10);
+        }
+
+        // Bulamazsa URL'deki otv= parametresini dene
+        if (!price) {
+          const priceLink = tr.querySelector('td.c_pe a[href]');
+          if (priceLink) {
+            const href = priceLink.getAttribute('href') || '';
+            // Önce otv= dene (yeni format), sonra x= (eski format)
+            const mOtv = href.match(/[?&]otv=(\d+)/);
+            const mX   = href.match(/[?&]x=(\d+)/);
+            if (mOtv) price = parseInt(mOtv[1], 10);
+            else if (mX) price = parseInt(mX[1], 10);
+          }
+        }
+
         if (!price) continue;
 
+        // Oda tipi
         const roomTd = tr.querySelector('td.c_ns');
         const roomType = roomTd ? roomTd.textContent.trim().split('\n')[0].trim() : 'UNKNOWN';
+
+        // Deduplication: aynı otel+oda daha önce eklendiyse atla
+        const dedupKey = `${hotelName}__${roomType}`;
+        if (seen.has(dedupKey)) continue;
+        seen.add(dedupKey);
 
         results.push({ hotelName, roomType, price });
       }
@@ -131,13 +167,7 @@ async function scrapePage(browser, url, checkIn, hotelId) {
   }, PENINSULA_PATTERNS, checkIn, hotelId);
 
   await page.close();
-
-  // hotelName boş kaldıysa hotelId'yi fallback olarak kullan —
-  // bu sayede state key'i her zaman tutarlı olur
-  return offers.map(o => ({
-    ...o,
-    hotelName: o.hotelName || `hotel_${hotelId}`,
-  }));
+  return offers;
 }
 
 async function scrapeWithDateShift(browser, url, checkIn, hotelId) {
@@ -186,6 +216,9 @@ async function main() {
   const dates  = generateDates();
   console.log(`Otel: ${hotels.length} | Tarihler: ${dates.map(d => d.checkIn).join(', ')}`);
 
+  // State'i çalışma başında bir kez yükle — concurrent task'lar prevState'i okur,
+  // newState'e yazar. Böylece yeni eklenen oteller için prevPrice=undefined olur
+  // ve alarm atılmaz (sadece state'e kaydedilir).
   const prevState = loadState();
   const newState  = { ...prevState };
   const alerts = [];
@@ -211,16 +244,15 @@ async function main() {
         const { offers, usedCheckIn } = await scrapeWithDateShift(browser, task.url, task.checkIn, task.hotelId);
 
         for (const o of offers) {
-          // KEY: hotelName artık her zaman dolu (fallback: hotel_ID)
-          // roomType boşsa da UNKNOWN yazdığından key hep tutarlı
           const key = `${usedCheckIn}__${o.hotelName}__${o.roomType}`;
-          const prevPrice = prevState[key];
+          const prevPrice = prevState[key];   // SADECE prevState'ten oku (başlangıç snapshot)
           const newPrice  = o.price;
 
-          // Her durumda state'e yaz — alarm olsa da olmasa da
+          // Her durumda state'e yaz
           newState[key] = newPrice;
 
-          if (prevPrice && prevPrice > 0) {
+          // Alarm: sadece daha önce görülmüş ve düşmüş ise
+          if (prevPrice && prevPrice > 0 && newPrice > 0) {
             const drop = (prevPrice - newPrice) / prevPrice;
             if (drop >= DROP_THRESHOLD) {
               alerts.push({
@@ -233,6 +265,8 @@ async function main() {
               });
               console.log(`  ⚠️ DÜŞÜŞ: ${o.hotelName} | ${o.roomType} | ${prevPrice}→${newPrice} EUR (-%${Math.round(drop*100)})`);
             }
+          } else if (!prevPrice) {
+            console.log(`  📝 YENİ: ${o.hotelName} | ${o.roomType} | ${usedCheckIn} → ${newPrice} EUR (state'e kaydedildi)`);
           }
         }
       } catch (e) {
@@ -255,6 +289,7 @@ async function main() {
   if (alerts.length > 0) {
     console.log(`${alerts.length} fiyat düşüşü tespit edildi. Bildirim gönderiliyor...`);
 
+    // Otel+oda bazında grupla
     const groups = {};
     for (const a of alerts) {
       const key = `${a.hotel}__${a.room}`;
