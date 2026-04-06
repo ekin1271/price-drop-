@@ -4,16 +4,15 @@ const https = require('https');
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const TELEGRAM_GROUP_ID = process.env.GROUP_CHAT_ID;
 const STATE_FILE = 'drop_state.json';
 const HOTELS_FILE = 'hotels.json';
 const CONCURRENCY = 8;
-const DROP_THRESHOLD = 0.40;
+const DROP_THRESHOLD = 0.50; // %50 düşüş
 
 const PENINSULA_PATTERNS = [
-  '103810219',
-  '103810221461',
-  '103810221462',
+  '103810219',    // Antalya
+  '103810221461', // Bodrum
+  '103810221462', // Bodrum
 ];
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -48,30 +47,24 @@ function generateDates() {
   return dates;
 }
 
-function buildUrl(hotel, checkIn, checkOut) {
-  const idPrice = hotel.id_price || '121110211811';
-  return `https://www.bgoperator.ru/price.shtml?action=price&tid=211&idt=&flt2=100510000863&id_price=${idPrice}&data=${checkIn}&d2=${checkOut}&f7=7&f3=&f8=&ho=0&F4=${hotel.id}&ins=0-40000-EUR&flt=100411293179&p=${hotel.p}`;
+function buildUrl(hotelId, checkIn, checkOut) {
+  return `https://www.bgoperator.ru/price.shtml?action=price&tid=211&idt=&flt2=100510000863&id_price=121110211811&data=${checkIn}&d2=${checkOut}&f7=7&f3=&f8=&ho=0&F4=${hotelId}&ins=0-40000-EUR&flt=100411293179&p=0100319900.0100319900`;
 }
 
 // ─── Telegram ────────────────────────────────────────────────────────────────
 async function sendTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) { console.log('[TEL]', text.slice(0, 120)); return; }
-  const targets = [TELEGRAM_CHAT_ID];
-  if (TELEGRAM_GROUP_ID) targets.push(TELEGRAM_GROUP_ID);
-
-  for (const chatId of targets) {
-    const body = JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true });
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    await new Promise((resolve, reject) => {
-      const req = https.request(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-      }, (res) => { res.resume(); res.on('end', resolve); });
-      req.on('error', reject);
-      req.write(body);
-      req.end();
-    });
-  }
+  const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML', disable_web_page_preview: true });
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  await new Promise((resolve, reject) => {
+    const req = https.request(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => { res.resume(); res.on('end', resolve); });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
 }
 
 // ─── Scrape ──────────────────────────────────────────────────────────────────
@@ -84,24 +77,25 @@ async function scrapePage(browser, url, checkIn, hotelId) {
   try { await page.waitForSelector('div.b-pr', { timeout: 30000 }); } catch(e) {}
   await sleep(2000);
 
-  const offers = await page.evaluate((peninsulaPatterns, targetDate, fallbackHotelId) => {
-    // Her (hotelName, roomType) çifti için sadece BİR kayıt döndür.
-    const seen = new Set();
+  const peninsulaPatterns = PENINSULA_PATTERNS;
+
+  const offers = await page.evaluate((peninsulaPatterns, targetDate, expectedHotelId) => {
     const results = [];
     const blocks = document.querySelectorAll('div.b-pr');
 
     for (const block of blocks) {
-      // YENİ SELECTOR: otel adı artık div.name > a içinde
-      let hotelName = '';
-      const nameDiv = block.querySelector('div.name a');
-      if (nameDiv) {
-        hotelName = nameDiv.textContent.trim();
-      } else {
-        // Fallback: eski selector
-        const hotelLink = block.querySelector('a[href*="code="]');
-        if (hotelLink) hotelName = hotelLink.textContent.trim();
+      // data-hid kontrolü
+      if (expectedHotelId) {
+        const nameDiv = block.querySelector('div.name[data-hid]');
+        if (nameDiv) {
+          const dataHid = nameDiv.getAttribute('data-hid');
+          if (dataHid && dataHid !== expectedHotelId) continue;
+        }
       }
-      if (!hotelName) hotelName = `hotel_${fallbackHotelId}`;
+
+      let hotelName = '';
+      const hotelLink = block.querySelector('a[href*="action=shw"]');
+      if (hotelLink) hotelName = hotelLink.textContent.trim();
 
       const allRows = block.querySelectorAll('tr');
 
@@ -109,8 +103,7 @@ async function scrapePage(browser, url, checkIn, hotelId) {
         const allLis = tr.querySelectorAll('li.s8.i_t1');
         if (allLis.length === 0) continue;
 
-        // Hedef tarihe en yakın li'yi seç
-        let chosenLi = null;
+        let chosenLi = allLis[0];
         if (targetDate) {
           for (const li of allLis) {
             if ((li.getAttribute('urr') || '').includes(targetDate)) {
@@ -119,52 +112,26 @@ async function scrapePage(browser, url, checkIn, hotelId) {
             }
           }
         }
-        if (!chosenLi) chosenLi = allLis[0];
 
         const urr = chosenLi.getAttribute('urr') || '';
         const isPeninsula = peninsulaPatterns.some(p => urr.includes(p));
         if (!isPeninsula) continue;
 
-        // YENİ FIYAT SELECTOR: <b class="r">XXXX</b> içindeki sayı
-        // Alternatif: URL'deki otv= parametresi
-        let price = 0;
-
-        // Önce <b class="r"> dene
-        const priceB = tr.querySelector('td.c_pe b.r, td.c_pe b');
-        if (priceB) {
-          const raw = priceB.textContent.trim().replace(/\s/g, '').replace(/[^\d]/g, '');
-          price = parseInt(raw, 10);
-        }
-
-        // Bulamazsa URL'deki otv= parametresini dene
-        if (!price) {
-          const priceLink = tr.querySelector('td.c_pe a[href]');
-          if (priceLink) {
-            const href = priceLink.getAttribute('href') || '';
-            // Önce otv= dene (yeni format), sonra x= (eski format)
-            const mOtv = href.match(/[?&]otv=(\d+)/);
-            const mX   = href.match(/[?&]x=(\d+)/);
-            if (mOtv) price = parseInt(mOtv[1], 10);
-            else if (mX) price = parseInt(mX[1], 10);
-          }
-        }
-
+        const priceLink = tr.querySelector('td.c_pe a[href*="x="]');
+        if (!priceLink) continue;
+        const m = (priceLink.getAttribute('href') || '').match(/[?&]x=(\d+)/);
+        if (!m) continue;
+        const price = parseInt(m[1], 10);
         if (!price) continue;
 
-        // Oda tipi
         const roomTd = tr.querySelector('td.c_ns');
         const roomType = roomTd ? roomTd.textContent.trim().split('\n')[0].trim() : 'UNKNOWN';
-
-        // Deduplication: aynı otel+oda daha önce eklendiyse atla
-        const dedupKey = `${hotelName}__${roomType}`;
-        if (seen.has(dedupKey)) continue;
-        seen.add(dedupKey);
 
         results.push({ hotelName, roomType, price });
       }
     }
     return results;
-  }, PENINSULA_PATTERNS, checkIn, hotelId);
+  }, peninsulaPatterns, checkIn, hotelId);
 
   await page.close();
   return offers;
@@ -216,9 +183,6 @@ async function main() {
   const dates  = generateDates();
   console.log(`Otel: ${hotels.length} | Tarihler: ${dates.map(d => d.checkIn).join(', ')}`);
 
-  // State'i çalışma başında bir kez yükle — concurrent task'lar prevState'i okur,
-  // newState'e yazar. Böylece yeni eklenen oteller için prevPrice=undefined olur
-  // ve alarm atılmaz (sadece state'e kaydedilir).
   const prevState = loadState();
   const newState  = { ...prevState };
   const alerts = [];
@@ -231,8 +195,8 @@ async function main() {
   try {
     const tasks = [];
     for (const { checkIn, checkOut } of dates) {
-      for (const hotel of hotels) {
-        tasks.push({ url: buildUrl(hotel, checkIn, checkOut), checkIn, hotelId: hotel.id });
+      for (const hotelId of hotels) {
+        tasks.push({ url: buildUrl(hotelId, checkIn, checkOut), checkIn, hotelId });
       }
     }
     console.log(`Toplam istek: ${tasks.length}`);
@@ -245,14 +209,14 @@ async function main() {
 
         for (const o of offers) {
           const key = `${usedCheckIn}__${o.hotelName}__${o.roomType}`;
-          const prevPrice = prevState[key];   // SADECE prevState'ten oku (başlangıç snapshot)
+          const prevPrice = prevState[key];
           const newPrice  = o.price;
 
-          // Her durumda state'e yaz
+          // State'e kaydet
           newState[key] = newPrice;
 
-          // Alarm: sadece daha önce görülmüş ve düşmüş ise
-          if (prevPrice && prevPrice > 0 && newPrice > 0) {
+          // Önceki fiyat varsa ve %50'den fazla düştüyse alarm
+          if (prevPrice && prevPrice > 0) {
             const drop = (prevPrice - newPrice) / prevPrice;
             if (drop >= DROP_THRESHOLD) {
               alerts.push({
@@ -265,8 +229,6 @@ async function main() {
               });
               console.log(`  ⚠️ DÜŞÜŞ: ${o.hotelName} | ${o.roomType} | ${prevPrice}→${newPrice} EUR (-%${Math.round(drop*100)})`);
             }
-          } else if (!prevPrice) {
-            console.log(`  📝 YENİ: ${o.hotelName} | ${o.roomType} | ${usedCheckIn} → ${newPrice} EUR (state'e kaydedildi)`);
           }
         }
       } catch (e) {
@@ -289,7 +251,7 @@ async function main() {
   if (alerts.length > 0) {
     console.log(`${alerts.length} fiyat düşüşü tespit edildi. Bildirim gönderiliyor...`);
 
-    // Otel+oda bazında grupla
+    // Gruplama
     const groups = {};
     for (const a of alerts) {
       const key = `${a.hotel}__${a.room}`;
